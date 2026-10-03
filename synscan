@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import argparse
+import time
+import ipaddress
+import random
+import socket
+import warnings
+from collections import Counter
+
+
+warnings.filterwarnings("ignore")
+
+from scapy.all import (ARP, ICMP, IP, TCP, Ether , conf, sr, srp)
+
+SYN, RST, ACK = 0x02, 0x04, 0x10
+
+SYN_ACK = SYN | ACK
+
+MAX_HOSTS = 4096
+
+def parse_ports(spec):
+    ports = set()
+    for part in spec.split(','):
+        part = part.strip()
+        if '-' in part:
+            lo, hi = part.split('-', 1)
+            ports.update(range(int(lo), int(hi) + 1))
+        else:
+            ports.add(int(part))
+
+    if any(p < 1 or p > 65535 for p in ports):
+        raise ValueError("\n Port must be between 1 and 65535")
+
+    return sorted(ports)
+
+def service_name(port):
+    try:
+        return socket.getservbyport(port, "tcp")
+    except OSError:
+        return "unknown"
+
+
+def build_targets(spec):
+    if "/" in spec:
+        net = ipaddress.ip_network(spec, strict=False)
+        if net.version != 4:
+            raise ValueError("\n Only IPv4 is supported")
+        return list(net.hosts()) or [net.network_address]
+    return [ipaddress.ip_address(socket.gethostbyname(spec))]
+
+def is_local(ip):
+    _iface, _src, gateway = conf.route.route(str(ip))
+    return gateway == "0.0.0.0"
+
+
+def arp_sweep(targets, timeout):
+    packet = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=targets)
+    answered, _ = srp(packet, timeout=timeout, retry=1, verbose=0)
+    return {rcv[ARP].psrc for _, rcv in answered}
+
+def ping_sweep(targets, timeout):
+    alive = set()
+    answered, _ = sr(IP(dst=targets) / ICMP(), timeout=timeout, retry=1, verbose=0)
+    for _, rcv in answered:
+        if rcv.haslayer(ICMP) and rcv[ICMP].type == 0:
+            alive.add(rcv[IP].src)
+
+    answered, _ = sr(IP(dst=targets) / TCP(dport=[80,443], flags="S"), timeout=1, retry=1, verbose=0)
+    for _, rcv in answered:
+        if rcv.haslayer(TCP):
+            alive.add(rcv[IP].src)
+
+    return alive
+
+def discover(hosts, timeout):
+    targets = [str(h) for h in hosts]
+
+    if is_local(hosts[0]):
+        method, found = "ARP", arp_sweep(targets, timeout)
+    else:
+        method, found = "ICMP/TCP Ping", ping_sweep(targets, timeout)
+
+    alive = sorted(found, key=ipaddress.ip_address)
+    return method, alive
+
+def classify(reply):
+    if reply.haslayer(TCP):
+        flags = int(reply[TCP].flags)
+        if flags & SYN_ACK == SYN_ACK:
+            return "open"
+        if flags & RST:
+            return "closed"
+
+    return "filtered"
+
+def syn_scan(ip, ports, timeout, retries):
+
+    sport = random.randint(20000, 60000)
+    probes = IP(dst=ip) / TCP(sport=sport, dport=ports, flags="s")
+
+    answered, unanswered = sr(probes, timeout=timeout, retry=retries, verbose=0)
+
+    states = {}
+    for sent, received in answered:
+        states[sent[TCP].dport] = classify(received)
+    for sent in unanswered:
+        states[sent[TCP].dport] = "filtered"
+
+    return states
+
+def report(ip, states, verbose):
+    counts = Counter(states.values())
+    print(f"\n Host {ip} is up")
+
+    if counts["open"] or verbose:
+        print(f"{'PORT':<10}{'STATE':<10}SERVICE")
+        for port in sorted(states):
+            if verbose or states[port] == "open":
+                print(f"{str(port) + '/tcp':<10}{states[port]:<10}{service_name(port)}")
+
+    else:
+        print("No ports are open")
+
+    if not verbose:
+        hidden = [f"{counts[s]}{s}" for s in ("closed", "filtered") if counts[s]]
+        if hidden:
+            print(f"Not shown: {', '.join(hidden)}")
+
+    return counts["open"]
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="synscan", description="A Small SYN Network Scanner"
+    )
+    parser.add_argument("target", help="Target IP address or Hostname")
+    parser.add_argument("-p", "--port",  default="1-1024", help="Port range (eg: 80, 443) [default: 1-1024]")
+    parser.add_argument("-t", "--timeout", type=float, default=2.0, help="Seconds to wait for reply [default: 2.0]")
+    parser.add_argument("-r", "--retries", type=int, default=1, help="Number of times to retry [default: 1]")
+    parser.add_argument("-Pn", "--no-ping", action="store_true", help="Skip host discovery")
+    parser.add_argument("--discover-only", action="store_true", help="Only list live hosts")
+    parser.add_argument("--force", action="store_true", help="More than the max number of allowed hosts")
+    parser.add_argument("-v", "--verbose", action="store_true", help="List everything")
+
+    args = parser.parse_args()
+
+    if os.geteuid() != 0:
+        sys.exit("You must have root privileges to run this script[Try: sudo synscan ...]")
+
+    try:
+        ports = parse_ports(args.port)
+    except ValueError as e:
+        parser.error(f"Invalid port {args.port}: {e}")
+
+    try:
+        hosts = build_targets(args.target)
+    except (ValueError, OSError) as e:
+        parser.error(f"Invalid target {args.target}: {e}")
+
+    if len(hosts) > MAX_HOSTS and not args.force:
+        sys.exit(f"{len(hosts)} is more the the max number of allowed hosts of {MAX_HOSTS}[Try: --force to allow more hosts]")
+
+    conf.verb = 0
+    start = time.time()
+
+    if len(hosts) > 1 and not args.no_ping:
+        print(f"Discovering hosts from {len(hosts)} addresses")
+        methods, alive = discover(hosts, args.timeout)
+        print(f"{methods} : {len(alive)} hosts are up!")
+
+    else:
+        alive = [str(h) for h in hosts]
+
+
+    if args.discover_only:
+        for ip in alive:
+            print(f"{ip}")
+        return
+
+    total_open = 0
+
+    for ip in alive:
+        states = syn_scan(ip, ports, args.timeout, args.retries)
+        total_open += report(ip, states, args.verbose)
+
+    print(f"\n Done : {len(alive)} host(s) scanned in {time.time() - start} seconds and {total_open} open port(s)")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit("\n Interrupted")
