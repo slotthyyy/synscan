@@ -99,7 +99,7 @@ def classify(reply):
 def syn_scan(ip, ports, timeout, retries):
 
     sport = random.randint(20000, 60000)
-    probes = IP(dst=ip) / TCP(sport=sport, dport=ports, flags="s")
+    probes = IP(dst=ip) / TCP(sport=sport, dport=ports, flags="S")
 
     answered, unanswered = sr(probes, timeout=timeout, retry=retries, verbose=0)
 
@@ -186,7 +186,7 @@ def main():
         states = syn_scan(ip, ports, args.timeout, args.retries)
         total_open += report(ip, states, args.verbose)
 
-    print(f"\n Done : {len(alive)} host(s) scanned in {time.time() - start} seconds and {total_open} open port(s)")
+    print(f"\n Done : {len(alive)} host(s) scanned in {time.time() - start:.2f} seconds and {total_open} open port(s)")
 
 
 if __name__ == "__main__":
